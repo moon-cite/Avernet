@@ -83,6 +83,12 @@ _No dependents in the boundary-significant set._
 - `agentclaw.community.core.mcp`
 - `agentclaw.community.core.skill_center`
 
+## `agentclaw.community.core.bot_dormant`
+
+- `agentclaw.community.api`
+- `agentclaw.community.core.bot_management`
+- `agentclaw.community.core.repository`
+
 ## `agentclaw.community.core.bot_genome`
 
 - `agentclaw.community.api`
@@ -102,6 +108,7 @@ _No dependents in the boundary-significant set._
 - `agentclaw.community.core.bot_app_grant`
 - `agentclaw.community.core.bot_collaborator.manager_sync`
 - `agentclaw.community.core.bot_config_manifest`
+- `agentclaw.community.core.bot_dormant`
 - `agentclaw.community.core.bot_management.ownership_sync`
 - `agentclaw.community.core.bot_overview`
 - `agentclaw.community.core.bot_public`
@@ -272,6 +279,7 @@ _No dependents in the boundary-significant set._
 - `agentclaw.community.core.bot_chat`
 - `agentclaw.community.core.bot_collaborator.manager_sync`
 - `agentclaw.community.core.bot_config_manifest`
+- `agentclaw.community.core.bot_dormant`
 - `agentclaw.community.core.bot_genome`
 - `agentclaw.community.core.bot_knowledge`
 - `agentclaw.community.core.bot_management`
@@ -396,6 +404,7 @@ _No dependents in the boundary-significant set._
 - `agentclaw.community.core.bot_chat`
 - `agentclaw.community.core.bot_collaborator.manager_sync`
 - `agentclaw.community.core.bot_config_manifest`
+- `agentclaw.community.core.bot_dormant`
 - `agentclaw.community.core.bot_knowledge`
 - `agentclaw.community.core.bot_management`
 - `agentclaw.community.core.bot_management.ownership_sync`
