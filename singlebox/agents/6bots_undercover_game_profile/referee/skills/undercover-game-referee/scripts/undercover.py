@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import random
+import secrets
 import re
 import shlex
 import subprocess
@@ -664,7 +665,7 @@ def append_ui_context(instruction: str, context: dict[str, Any]) -> str:
 
 
 def actor_id_for(seat: dict[str, Any], state: dict[str, Any]) -> str:
-    return state["human_actor_id"] if seat["kind"] == "human" else seat["bot_uuid"]
+    return (seat.get("actor_id") or state["human_actor_id"]) if seat["kind"] == "human" else seat["bot_uuid"]
 
 
 def public_panel_projection(state: dict[str, Any], kind: str, attempt: int) -> dict[str, Any]:
@@ -680,7 +681,8 @@ def public_panel_projection(state: dict[str, Any], kind: str, attempt: int) -> d
     node_actor_map = {f"{node_prefix}_{seat['seat']}": actor_id_for(seat, state) for seat in acting}
     for node_id in (("collect",) if kind == "speak" else ("tally",)):
         node_actor_map[node_id] = state["referee_uuid"]
-    human = next((seat for seat in acting if seat["kind"] == "human"), None)
+    humans = [seat for seat in all_seats if seat["kind"] == "human"]
+    human = next((seat for seat in acting if seat["kind"] == "human"), None) if len(humans) == 1 else None
     current_action = None if human is None else {"actorId": actor_id_for(human, state), "type": "speech" if kind == "speak" else "vote", "nodeId": f"{node_prefix}_{human['seat']}"}
     history = [{"round": entry["round"], **({"stage": "pk"} if entry.get("stage") == "pk" else {}), "speeches": [{"actorId": actor_id_for(seat_of(state, item["seat"]), state), "seatNumber": item["seat"], "displayName": item["player"], "text": item["text"]} for item in entry["speeches"]]} for entry in public_history(state)]
     params: dict[str, Any] = {
@@ -688,18 +690,33 @@ def public_panel_projection(state: dict[str, Any], kind: str, attempt: int) -> d
         "phase": phase, "round": state["round"], "attempt": attempt,
         "host": {"actorId": state["referee_uuid"], "displayName": "主持人"}, "seatOrder": seat_order, "turnOrder": turn_order, "players": players, "nodeActorMap": node_actor_map,
         "publicHistory": history, "rules": {"speechMaxChars": SPEECH_MAX_CHARS, "voteMaxChars": VOTE_MAX_CHARS, "forbidOwnWord": kind == "speak", "bluntness": bluntness_n(state["round"])},
-        "currentViewerActorId": state["human_actor_id"], "currentAction": current_action,
+        "currentViewerActorId": state["human_actor_id"] if len(humans) == 1 else None,
+        "currentAction": current_action if len(humans) == 1 else None,
         "display": {"showVoteResults": False, "showHostOutput": True, "showTimer": True},
     }
+    if len(humans) > 1:
+        params["privateWordRefs"] = state.get("private_word_refs", {})
     if is_pk(state):
         params["pkCandidates"] = [actor_id_for(seat_of(state, seat), state) for seat in current_stage(state)["order"]]
     vote_history = public_vote_history(state)
     if vote_history:
         params["voteHistory"] = vote_history
-    if kind == "vote" and human is not None:
-        viewer_id = actor_id_for(human, state)
-        params["voteCandidates"] = [{"actorId": actor_id_for(seat, state), "displayName": seat["display"], "seatNumber": int(seat["seat"]), "eligible": True} for seat in living if actor_id_for(seat, state) != viewer_id and (not is_pk(state) or seat["seat"] in current_stage(state)["order"])]
     if kind == "vote":
+        viewer_id = actor_id_for(human, state) if human is not None else None
+        params["voteCandidates"] = [
+            {
+                "actorId": actor_id_for(seat, state),
+                "displayName": seat["display"],
+                "seatNumber": int(seat["seat"]),
+                "eligible": True,
+            }
+            for seat in living
+            if (viewer_id is None or actor_id_for(seat, state) != viewer_id)
+            and (not is_pk(state) or seat["seat"] in current_stage(state)["order"])
+        ]
+    if kind == "vote":
+        if len(humans) > 1:
+            params["voteTallyNodeId"] = "tally"
         params["resultFile"] = f"undercover-result-v1-r{state['round']}{'-pk' if is_pk(state) else ''}-a{attempt}.json"
         params["openingAnnouncement"] = opening_announcement(state, kind, attempt)
     return params
@@ -747,6 +764,15 @@ def opening_announcement(state: dict[str, Any], kind: str, attempt: int) -> str:
             f"从 {lead['seat']}号 {lead['display']} 开始依次发言；轮到你时请在副屏填写。")
 
 
+def has_private_human_words(state: dict[str, Any]) -> bool:
+    humans = [s for s in state["seats"] if s["kind"] == "human"]
+    if len(humans) <= 1:
+        return True
+    refs = state.get("private_word_refs") or {}
+    return all(isinstance(refs.get(actor_id_for(s, state)), str)
+               and refs[actor_id_for(s, state)].startswith("undercover_word_") for s in humans)
+
+
 def render_speak_yaml(state: dict[str, Any]) -> tuple[str, list[str]]:
     rnd = state["round"]
     pk = is_pk(state)
@@ -776,19 +802,23 @@ def render_speak_yaml(state: dict[str, Any]) -> tuple[str, list[str]]:
             # 白名单）是写给模型看的硬约束，人类读到一半就跳过了——实测他两轮都
             # 直接给了定义句。他需要的只是：我是几号、我的词、一句话多长、别说出
             # 那个词、说钝一点。字面泄词有 check_text 兜底，不必在这里枚举。
+            multi = len(state.get('human_actor_ids') or []) > 1
             instruction = append_ui_context((
-                f"【你的词语】{s['word']}\n\n"
-                f"第 {rnd} 轮 · 你是 {s['seat']} 号 · 轮到你{phase_label}了。\n"
+                ("请在副屏私有词卡查看自己的词语。\n\n" if multi else f"【你的词语】{s['word']}\n\n")
+                + f"第 {rnd} 轮 · 你是 {s['seat']} 号 · 轮到你{phase_label}了。\n"
                 "上面能看到本轮在你之前的人说了什么。\n\n"
                 f"写一句话（不超过 {SPEECH_MAX_CHARS} 个字）描述你的词，"
                 "别把这个词说出来，也别拆开来说。\n"
                 f"说钝一点：这句话得能同时套在至少 {bluntness_n(rnd)} 样别的东西上。\n"
                 + ("本次 PK，可基于公开发言和已公布票面补充描述或辩解，不暴露私有信息。" if pk else
                  "别提身份、别点评别人，只说你的词。")
-            ), {"action": "speech", "round": rnd, "seatNumber": s["seat"], "word": s["word"], "maxChars": SPEECH_MAX_CHARS, "forbidOwnWord": True, "bluntness": bluntness_n(rnd)})
+            ), {"action": "speech", "round": rnd, "seatNumber": s["seat"], "word": None if multi else s["word"], "maxChars": SPEECH_MAX_CHARS, "forbidOwnWord": True, "bluntness": bluntness_n(rnd)})
             nodes.append(
                 f"      {nid}:\n"
                 f"        kind: human_input\n"
+                f"        assignee:\n"
+                f"          type: runtime_actor\n"
+                f"          actor: {yq(actor_id_for(s, state))}\n"
                 f"        display_name: {yq('👤 你的发言（' + str(s['seat']) + '号 · 人类玩家）')}\n"
                 f"        node_timeout_ms: {HUMAN_NODE_TIMEOUT_MS}\n"
                 f"        instruction: |\n{block(instruction, 10)}\n"
@@ -886,7 +916,16 @@ def render_vote_yaml(state: dict[str, Any]) -> tuple[str, list[str]]:
     # BCS requires one entry. A neutral player acknowledgement avoids
     # dispatching a task back to the referee while open-vote is still running.
     # It is not a vote and must not appear in nodeActorMap or progress counts.
-    starter = next(seat for seat in living if seat["kind"] == "bot")
+    starter = next((seat for seat in living if seat["kind"] == "bot"), None)
+    if starter is None:
+        starter = next((seat for seat in state["seats"] if seat["kind"] == "bot"), None)
+    if starter is None:
+        die("VOTE_START_NO_BOT", "没有可用于投票预备节点的 Bot；当前原型至少需要一个 Bot。")
+    if not starter["alive"]:
+        participants.insert(0,
+            f"  {starter['binding']}:\n"
+            f"    display_name: {yq(str(starter['seat']) + '号 ' + starter['display'])}\n"
+            "    required: true")
     start_instruction = (
         "【投票预备确认】主持人已经提交本轮投票。请原样输出下面这一句开场白：\n"
         "投票开始，请大家投出一票，等待主持人公布结果。\n"
@@ -911,17 +950,21 @@ def render_vote_yaml(state: dict[str, Any]) -> tuple[str, list[str]]:
         nid = node_ids[idx]
         others = "、".join(f"{o['seat']}号" for o in living if o["seat"] != s["seat"] and (not pk or o["seat"] in current_stage(state)["order"]))
         if s["kind"] == "human":
+            multi = len(state.get('human_actor_ids') or []) > 1
             instruction = append_ui_context((
-                f"【你的词语】{s['word']}\n\n"
-                f"第 {rnd} 轮{phase_label} · 你是 {s['seat']} 号。\n"
+                ("请在副屏私有词卡查看自己的词语。\n\n" if multi else f"【你的词语】{s['word']}\n\n")
+                + f"第 {rnd} 轮{phase_label} · 你是 {s['seat']} 号。\n"
                 "大家说过的话，主持人刚在群里念过一遍。\n\n"
                 f"可以投的人：{others}，不能投自己。\n"
                 "只写「我投N号」，N 是阿拉伯数字，不用写理由。\n"
                 + ("本次 PK 禁止弃权，必须选择一名合法候选。" if pk else "不想投就写「我弃权」。")
-            ), {"action": "vote", "round": rnd, "seatNumber": s["seat"], "word": s["word"], "allowAbstain": not pk})
+            ), {"action": "vote", "round": rnd, "seatNumber": s["seat"], "word": None if multi else s["word"], "allowAbstain": not pk})
             nodes.append(
                 f"      {nid}:\n"
                 f"        kind: human_input\n"
+                f"        assignee:\n"
+                f"          type: runtime_actor\n"
+                f"          actor: {yq(actor_id_for(s, state))}\n"
                 f"        display_name: {yq('👤 你的投票（' + str(s['seat']) + '号 · 人类玩家）')}\n"
                 f"        node_timeout_ms: {HUMAN_NODE_TIMEOUT_MS}\n"
                 f"        instruction: |\n{block(instruction, 10)}\n"
@@ -1007,6 +1050,8 @@ def render_vote_yaml(state: dict[str, Any]) -> tuple[str, list[str]]:
         "    nodes:\n" + "\n".join(nodes) + "\n"
     )
     bindings = [f"{s['binding']}={s['bot_uuid']}" for s in living if s["kind"] == "bot"]
+    if not starter["alive"]:
+        bindings.append(f"{starter['binding']}={starter['bot_uuid']}")
     bindings.append(f"referee={state['referee_uuid']}")
     return yaml_text, bindings
 
@@ -1196,7 +1241,7 @@ def submit_run(
     return data
 
 
-def session_roster(session_id: str, referee_uuid: str) -> tuple[dict[str, Any] | None, list[tuple[str, str]]]:
+def session_roster(session_id: str, referee_uuid: str) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """Validate the delivery recipient against the authoritative session roster."""
     code, out, _ = bcs_cli("session", "get", session_id)
     data = last_json(out)
@@ -1213,18 +1258,54 @@ def session_roster(session_id: str, referee_uuid: str) -> tuple[dict[str, Any] |
     managers = [p for p in participants if p.get("actor_kind", "bot") == "bot" and p.get("role") == "manager"]
     if len(managers) != 1 or managers[0]["bot_uuid"] != referee_uuid:
         die("REFEREE_MISMATCH", "本次 GroupContext.recipient 必须精确匹配会话中唯一 manager 的 bot_uuid。停止；不要按名称猜测或 connect 新身份。")
-    humans = [p for p in participants if p.get("actor_kind") == "human"]
-    if len(humans) > 1:
-        die("ROSTER_MISMATCH", "本游戏只支持一名人类玩家。停止，请核对会话成员。")
-    human = None if not humans else {
-        "actor_id": humans[0]["bot_uuid"],
-        "present": humans[0].get("mode") == "present",
-    }
+    humans = [
+        {
+            "actor_id": p["bot_uuid"],
+            "present": p.get("mode") == "present",
+        }
+        for p in participants
+        if p.get("actor_kind") == "human"
+    ]
     bots = [(str(p.get("bot_name") or p["bot_uuid"]), p["bot_uuid"]) for p in participants
             if p.get("actor_kind", "bot") == "bot" and p.get("role") == "worker"]
     if not bots:
         die("NO_BOTS", "当前会话没有 worker 玩家。停止，请核对会话角色。")
-    return human, bots
+    return humans, bots
+
+
+def create_private_human_words(state: dict[str, Any]) -> None:
+    """Give each Human a separately authorized, unguessable session-scoped word.
+
+    The referee's existing bcs-cli identity is the creator/owner. The public
+    panel contains only opaque entry names, NEVER their content. No secret is
+    returned to the referee's tool/thinking channel.
+    """
+    refs: dict[str, str] = {}
+    group_id = state["group_id"]
+    if not group_id:
+        die("GROUP_REQUIRED", "多人私有发牌需要有效 group ID。")
+    for seat in state["seats"]:
+        if seat["kind"] != "human":
+            continue
+        actor_id = actor_id_for(seat, state)
+        name = "undercover_word_" + secrets.token_hex(16)
+        visible = json.dumps({"userIds": [state["referee_uuid"], actor_id]}, separators=(",", ":"))
+        owner = json.dumps({"userIds": [state["referee_uuid"]]}, separators=(",", ":"))
+        code, out, err = bcs_cli(
+            "group-context", "add", "--group-id", group_id,
+            "--session-id", state["session_id"],
+            "--name", name, "--scope-level", "session",
+            "--content", seat["word"], "--visible-to", visible,
+            "--collect-from", owner,
+        )
+        data = last_json(out)
+        if code != 0 or not isinstance(data, dict) or data.get("status") != "ok":
+            # Never print a failed bcs-cli response: on unusual failures it may
+            # echo request args including private content.
+            die("PRIVATE_WORD_CREATE_FAILED",
+                "私有发牌失败（第 %s 号玩家）；停止开局，检查 BCS Group Context。" % seat["seat"])
+        refs[actor_id] = name
+    state["private_word_refs"] = refs
 
 
 def load_word_bank(difficulty: str) -> list[tuple[str, str]]:
@@ -1259,9 +1340,14 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not bots:
             die("NO_BOTS", "至少要有一个 Bot 玩家。")
 
-        human, roster = session_roster(args.session, referee_uuid)
-        if human is None or not human["present"] or human["actor_id"] != args.human:
-            die("ROSTER_MISMATCH", "发牌人类必须是当前会话中已 Present 的人类成员。停止，不发牌。")
+        humans, roster = session_roster(args.session, referee_uuid)
+        human_ids = {human["actor_id"] for human in humans}
+        requested_ids = set(args.human)
+        if (not humans or not all(human["present"] for human in humans)
+                or requested_ids != human_ids
+                or len(requested_ids) != len(args.human)):
+            die("ROSTER_MISMATCH",
+                "所有人类玩家必须已 Present，且 --human 名单必须与 Session 完全一致。")
         if len(bots) != len(roster) or {uuid for _, uuid in bots} != {uuid for _, uuid in roster}:
             die("ROSTER_MISMATCH", "玩家名单必须与当前 session 的 worker ID 完全一致，且不包含主持人或重复 ID。停止，重新核对 begin。")
         bots = roster
@@ -1271,7 +1357,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         cfg["difficulty"] = args.difficulty
         cfg["undercover"] = args.undercover
         cfg["max_rounds"] = args.max_rounds
-        cfg["players"] = len(bots) + 1
+        cfg["players"] = len(bots) + len(humans)
         if cfg["undercover"] >= cfg["players"]:
             die("BAD_CONFIG", "卧底人数必须小于总人数。")
 
@@ -1281,17 +1367,20 @@ def cmd_init(args: argparse.Namespace) -> None:
         if rng.randint(0, 1):
             civ, und = und, civ
 
-        order = [(name, uuid) for name, uuid in bots] + [("你", args.human)]
+        order = [(name, uuid) for name, uuid in bots] + [
+            ("人类玩家", human["actor_id"]) for human in humans
+        ]
         rng.shuffle(order)
 
         seats = []
         for idx, (who, actor_id) in enumerate(order, start=1):
-            if actor_id == args.human:
+            if actor_id in human_ids:
                 seats.append(
                     {
                         "seat": idx,
                         "kind": "human",
-                        "display": "你",
+                        "actor_id": actor_id,
+                        "display": "你" if len(humans) == 1 else f"{idx}号人类玩家",
                         "bot_name": None,
                         "bot_uuid": None,
                         "binding": None,
@@ -1306,6 +1395,7 @@ def cmd_init(args: argparse.Namespace) -> None:
                     {
                         "seat": idx,
                         "kind": "bot",
+                        "actor_id": actor_id,
                         "display": who[2:] if who.startswith("玩家") else who,
                         "bot_name": who,
                         "bot_uuid": actor_id,
@@ -1327,7 +1417,8 @@ def cmd_init(args: argparse.Namespace) -> None:
             "version": STATE_VERSION,
             "session_id": args.session,
             "group_id": args.group,
-            "human_actor_id": args.human,
+            "human_actor_id": humans[0]["actor_id"] if len(humans) == 1 else None,
+            "human_actor_ids": [human["actor_id"] for human in humans],
             "referee_uuid": referee_uuid,
             "phase": "AWAIT_START",
             "config": cfg,
@@ -1338,27 +1429,36 @@ def cmd_init(args: argparse.Namespace) -> None:
             "pending_ping": None,
             "result": None,
         }
+        if len(humans) > 1:
+            create_private_human_words(state)
         save_state(state)
 
-    emit(
-        {
-            "phase": "AWAIT_START",
-            "players": cfg["players"],
-            "undercover_count": cfg["undercover"],
-            "difficulty": cfg["difficulty"],
-            "max_rounds": cfg["max_rounds"],
-            "seating": [
-                {"seat": s["seat"], "player": s["display"], "kind": s["kind"]} for s in seats
-            ],
-            "human_seat": next(s["seat"] for s in seats if s["kind"] == "human"),
-            "human_word": next(s["word"] for s in seats if s["kind"] == "human"),
-            "referee_uuid": referee_uuid,
-            "next_action": NEXT_ACTION["AWAIT_START"],
-            "note": "human_word 是**人类玩家自己**那个词，也是全场唯一一个可以说出口的词——"
-            "群聊只有他看得到。发牌时在群里把它念给他（「你是 N 号，你的词是【X】」），"
-            "他忘了随时可以用 my-word 再问一次。别的座位的词一个字都不在这里。",
-        }
-    )
+    result = {
+        "phase": "AWAIT_START",
+        "players": cfg["players"],
+        "undercover_count": cfg["undercover"],
+        "difficulty": cfg["difficulty"],
+        "max_rounds": cfg["max_rounds"],
+        "seating": [
+            {"seat": s["seat"], "player": s["display"], "kind": s["kind"]}
+            for s in seats
+        ],
+        "referee_uuid": referee_uuid,
+    }
+    if len(humans) == 1:
+        human_seat = next(s for s in seats if s["kind"] == "human")
+        result["human_seat"] = human_seat["seat"]
+        result["human_word"] = human_seat["word"]
+        result["next_action"] = NEXT_ACTION["AWAIT_START"]
+    else:
+        result["human_seats"] = [
+            s["seat"] for s in seats if s["kind"] == "human"
+        ]
+        result["next_action"] = (
+            "所有人类已由私有 Group Context 发词。不要在群里报词。"
+            "告诉玩家进入发言副屏可查看本人词，随后执行 open-round。"
+        )
+    emit(result)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -1388,7 +1488,11 @@ def cmd_status(args: argparse.Namespace) -> None:
         # 己的会话里灌一条 [任务状态]，那条灌入会打断裁判当时正在跑的激活。
         # 平票那一轮改成：开票稿回灌把裁判叫醒，它直接 open-round。
         "pending_ping": (ping or {}).get("bot_name") if (ping or {}).get("kind") == "eulogy" else None,
-        "next_action": NEXT_ACTION.get(state["phase"], "先跑 status"),
+        "next_action": (
+            "私密发牌完成，不要公开词语；可直接 open-round。"
+            if state["phase"] == "AWAIT_START" and len(state.get("human_actor_ids") or []) > 1
+            else NEXT_ACTION.get(state["phase"], "先跑 status")
+        ),
     }
     if state["phase"] == "FINISHED":
         if state.get("public_result") and not state.get("revealed_at"):
@@ -1414,7 +1518,13 @@ def cmd_status(args: argparse.Namespace) -> None:
                 for s in state["seats"]
                 if not s["alive"]
             ],
-            "human_seat": next(s["seat"] for s in state["seats"] if s["kind"] == "human"),
+            "human_seats": [
+                s["seat"] for s in state["seats"] if s["kind"] == "human"
+            ],
+            "human_seat": next(
+                (s["seat"] for s in state["seats"] if s["kind"] == "human"),
+                None,
+            ) if sum(s["kind"] == "human" for s in state["seats"]) == 1 else None,
             "pending_ping_detail": ping,
             "renders": (state["rounds"][-1].get("renders", {}) if state["rounds"] else {}),
             "result": state["result"],
@@ -1436,6 +1546,8 @@ def run_file_kind(kind: str, rnd: int, attempt: int) -> str:
 def prepare_speak_run(session_id: str, retry: bool) -> dict[str, Any]:
     with locked(session_id):
         state = load_state(session_id)
+        if sum(s["kind"] == "human" for s in state["seats"]) > 1 and not has_private_human_words(state):
+            die("PRIVATE_WORD_NOT_READY", "多人私有词条缺失，停止创建状态机运行。")
         pk = state["phase"] in ("AWAIT_PK_SPEAK_START", "PK_SPEAK_RUNNING")
         if retry:
             # 重开当前这一轮：上一次提交的运行失败了，而运行失败不会唤醒裁判。
@@ -1578,6 +1690,8 @@ def cmd_speeches_set(args: argparse.Namespace) -> None:
 def prepare_vote_run(session_id: str, retry: bool) -> dict[str, Any]:
     with locked(session_id):
         state = load_state(session_id)
+        if sum(s["kind"] == "human" for s in state["seats"]) > 1 and not has_private_human_words(state):
+            die("PRIVATE_WORD_NOT_READY", "多人私有词条缺失，停止创建状态机运行。")
         if retry:
             # 投票运行失败不会唤醒裁判，phase 却已经推到 VOTE_RUNNING 了。
             # 没有这条路，卡住诊断走到重开那一步就会被阶段卫兵拦死。
@@ -1890,7 +2004,11 @@ def cmd_my_word(args: argparse.Namespace) -> None:
     次数不限。给的永远只有人类自己那一个词。
     """
     state = load_state(args.session)
-    human = next((s for s in state["seats"] if s["kind"] == "human"), None)
+    human_seats = [s for s in state["seats"] if s["kind"] == "human"]
+    if len(human_seats) > 1:
+        die("PRIVATE_WORD_NOT_READY",
+            "多人模式不能通过裁判公共命令输出秘密词。")
+    human = human_seats[0] if human_seats else None
     if human is None:
         die("NO_HUMAN", "这一局没有人类玩家。")
     emit(
@@ -1928,59 +2046,59 @@ def cmd_mask(args: argparse.Namespace) -> None:
 
 
 def cmd_begin(args: argparse.Namespace) -> None:
-    """开局前的全部探测一次做完：人类在不在、有哪些 Bot、我自己是谁、init 怎么写。
-
-    这一步以前要模型自己拼三条 jq、还要去猜自己的 UUID，每一条都要一个来回，每个
-    来回都会在群里留下一段状态旁白。现在一条命令给完。
-    """
     referee_uuid = args.referee_uuid
-    human, bots = session_roster(args.session, referee_uuid)
+    humans, bots = session_roster(args.session, referee_uuid)
 
-    if human is None:
-        emit(
-            {
-                "human_present": False,
-                "reason": "这个会话里还没有人类参与者。",
-                "next_action": "说「加入提示」那段，结束激活。人类加入后会发消息过来，届时重跑 begin。",
-            },
-            compact=True,
-        )
-        return
-    if not human["present"]:
-        emit(
-            {
-                "human_present": False,
-                "human_actor_id": human["actor_id"],
-                "reason": "人类在会话里但没有加入（mode 不是 present），含用户输入节点的运行会被拒。",
-                "next_action": "说「加入提示」那段，结束激活。他加入后会发消息过来，届时重跑 begin。",
-            },
-            compact=True,
-        )
+    if not humans:
+        emit({
+            "human_present": False,
+            "reason": "当前会话没有人类参与者。",
+            "next_action": "等待人类加入后重新执行 begin。",
+        }, compact=True)
         return
 
-    init_cmd = " ".join(
-        [
-            "uc init",
-            "--referee-uuid", shlex.quote(referee_uuid),
-            "--session", shlex.quote(args.session),
-            "--group", shlex.quote(args.group),
-            "--human", shlex.quote(human["actor_id"]),
-        ]
-        + [x for name, uuid in bots for x in ("--bot", shlex.quote(f"{name}={uuid}"))]
-        + ["--difficulty", args.difficulty, "--undercover", str(args.undercover),
-           "--max-rounds", str(args.max_rounds)]
-    )
-    emit(
-        {
-            "human_present": True,
-            "human_actor_id": human["actor_id"],
-            "bots": [name for name, _ in bots],
-            "referee_uuid": referee_uuid,
-            "init_command": init_cmd,
-            "next_action": "说开场白，请人类回一句「开始」。**这一步不 init**——他可能还想先问问规则。",
-        },
-        compact=True,
-    )
+    missing = [h["actor_id"] for h in humans if not h["present"]]
+    if missing:
+        emit({
+            "human_present": False,
+            "missing_humans": missing,
+            "next_action": "等待所有人类玩家加入后重新执行 begin。",
+        }, compact=True)
+        return
+
+    parts = [
+        "uc init",
+        "--referee-uuid", shlex.quote(referee_uuid),
+        "--session", shlex.quote(args.session),
+        "--group", shlex.quote(args.group or resolve_group(None, args.session)),
+    ]
+    for human in humans:
+        parts += ["--human", shlex.quote(human["actor_id"])]
+    for name, uuid in bots:
+        parts += ["--bot", shlex.quote(f"{name}={uuid}")]
+    parts += [
+        "--difficulty", args.difficulty,
+        "--undercover", str(args.undercover),
+        "--max-rounds", str(args.max_rounds),
+    ]
+
+    result = {
+        "human_present": True,
+        "human_count": len(humans),
+        "human_actor_ids": [h["actor_id"] for h in humans],
+        "bots": [name for name, _ in bots],
+        "referee_uuid": referee_uuid,
+        "init_command": " ".join(parts),
+        "next_action": (
+            "说开场白，等待玩家确认后执行 init；这一步不自动初始化。"
+            if len(humans) == 1 else
+            "多人开局需获得参与者确认。初始化后暂不启动发言，"
+            "开局后每名人类分别从私有 Group Context 获取自己的词，勿在公共群聊报词。"
+        ),
+    }
+    if len(humans) == 1:
+        result["human_actor_id"] = humans[0]["actor_id"]
+    emit(result, compact=True)
 
 
 def cmd_open_round(args: argparse.Namespace) -> None:
@@ -2235,7 +2353,7 @@ def main() -> None:
 
     p = with_session(sub.add_parser("init", help="开一局：抽词、排座位、抽卧底"))
     p.add_argument("--group", default=None)
-    p.add_argument("--human", required=True)
+    p.add_argument("--human", action="append", required=True)
     p.add_argument(
         "--referee-uuid",
         required=True,

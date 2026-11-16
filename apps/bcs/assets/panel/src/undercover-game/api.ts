@@ -106,3 +106,39 @@ export function respondToHumanNode(
     signal,
   }, fetchImpl);
 }
+
+/** Actor identity is resolved from the actual authenticated browser request. */
+export async function fetchCurrentHumanActorId(baseUrl: string, signal?: AbortSignal): Promise<string> {
+  const response = await requestJson<{ actor_uuid?: string | null }>(baseUrl, '/me', { signal });
+  if (!response?.actor_uuid || !/^human_[A-Za-z0-9]+$/.test(response.actor_uuid)) {
+    throw new ApiRequestError('BCS 未提供有效的人类登录身份。');
+  }
+  return response.actor_uuid;
+}
+
+/** Scope is a preference for UI projection, not a security authorization boundary. */
+export async function fetchCurrentHumanScope(baseUrl: string, sessionId: string, actorId: string, signal?: AbortSignal): Promise<'participant' | 'full'> {
+  const session = await requestJson<{ participants?: Array<{ bot_uuid?: string; message_view_scope?: string }> }>(
+    baseUrl, `/sessions/${encodeURIComponent(sessionId)}`, { signal },
+  );
+  const mine = session?.participants?.find((member) => member.bot_uuid === actorId);
+  if (!mine) throw new ApiRequestError('当前身份不在此会话中。');
+  return mine.message_view_scope === 'participant' ? 'participant' : 'full';
+}
+
+/** Private word content is returned only when BCS authenticates the requesting actor
+ * as a member of the Group Context entry's visible_to list. The random entry
+ * name from public metadata is not itself an access token. */
+export async function fetchPrivateHumanWord(
+  baseUrl: string, groupId: string, sessionId: string, entryName: string, signal?: AbortSignal,
+): Promise<string> {
+  const query = new URLSearchParams({ groupId, sessionId });
+  const result = await requestJson<{ status: string; items?: Array<{ content?: string }> }>(
+    baseUrl, `/groupcontext/get?${query.toString()}`,
+    { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: entryName, scope_levels: ['session'], limit: 1 }), signal },
+  );
+  const word = result?.items?.[0]?.content;
+  if (!word || typeof word !== 'string') throw new ApiRequestError('私有词不可读取，已阻止不安全的发言。');
+  return word;
+}

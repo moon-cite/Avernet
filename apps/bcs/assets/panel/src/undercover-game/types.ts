@@ -28,7 +28,7 @@ export interface UndercoverGamePanelParams {
   openingAnnouncement?: string; deadlineAt?: number; host: HostActor; seatOrder: string[]; turnOrder: string[]; players: PlayerActor[]; nodeActorMap: Record<string, string>;
   publicHistory: PublicHistoryRound[]; pkCandidates?: string[]; voteHistory?: PublicVoteRound[]; rules: PublicRules; voteCandidates?: VoteCandidate[]; apiBaseUrl?: string; currentViewerActorId?: string;
   currentAction?: CurrentAction; display?: PublicDisplayFlags; pollingInterval?: number; autoRefresh?: boolean; maxResponseBytes?: number;
-  resultFile?: string;
+  resultFile?: string; voteTallyNodeId?: string; privateWordRefs?: Record<string, string>;
 }
 export interface PanelAction { type: 'send_message'; content: string }
 export interface UndercoverGamePanelProps extends Partial<UndercoverGamePanelParams> {

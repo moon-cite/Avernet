@@ -305,6 +305,10 @@ pub fn validate_definition(
             StateMachineNodeKind::HumanInput => {
                 match (&node.notification, &node.assignee) {
                     (None, None) => {}
+
+		    (None, Some(StateMachineAssignee::RuntimeActor { actor }))
+                        if !actor.trim().is_empty() => {},
+
                     (None, Some(_)) => {
                         return invalid(format!(
                             "frontend human_input node {node_id} must not define assignee"
@@ -695,16 +699,41 @@ fn ensure_human_inputs_are_ordered(
 
     for (index, left) in human_nodes.iter().enumerate() {
         for right in human_nodes.iter().skip(index + 1) {
-            if !node_reaches(nodes, left, right) && !node_reaches(nodes, right, left) {
-                return invalid(format!(
-                    "human_input nodes {left} and {right} may wait concurrently; MVP requires HumanInput nodes to have an explicit dependency order"
-                ));
+            let left_actor = match &nodes[*left].assignee {
+                Some(StateMachineAssignee::RuntimeActor { actor })
+                    if !actor.trim().is_empty() =>
+                {
+                    Some(actor.as_str())
+                }
+                _ => None,
+             };
+
+        let right_actor = match &nodes[*right].assignee {
+            Some(StateMachineAssignee::RuntimeActor { actor })
+                if !actor.trim().is_empty() =>
+            {
+                Some(actor.as_str())
+            }
+            _ => None,
+        };
+
+        if let (Some(a), Some(b)) = (left_actor, right_actor) {
+            if a != b {
+                continue;
             }
         }
+
+        if !node_reaches(nodes, left, right)
+            && !node_reaches(nodes, right, left)
+        {
+            return invalid(format!(
+                "human_input nodes {left} and {right} may wait concurrently"
+            ));
+        }
     }
+}
     Ok(())
 }
-
 fn node_reaches(
     nodes: &BTreeMap<String, bcs_domain::StateMachineNodeDefinition>,
     start: &str,
